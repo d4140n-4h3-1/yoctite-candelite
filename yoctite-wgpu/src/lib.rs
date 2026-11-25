@@ -1310,10 +1310,33 @@ pub fn frustum_planes(view_projection: &[[f32; 4]; 4]) -> [[f32; 4]; 6] {
 enum Readback {
     /// Free: the next culling copies its counts into it.
     Idle,
-    /// A culling's counts were copied into it; mapped at the next.
-    Copied,
-    /// Waiting for the GPU to hand it over.
+    /// A culling's counts were copied into it, and it is mapped once the commands copying them
+    /// are submitted (see [`MAPPED`]): waiting for the GPU to hand it over.
     Mapping,
+}
+
+/// How the read-back's mapping is going, shared with the callback wgpu calls: not yet.
+const PENDING: u8 = 0;
+/// Mapped: the counts can be read.
+const MAPPED: u8 = 1;
+/// It failed, or the commands copying the counts were dropped unsubmitted: nothing to read, and
+/// the read-back is free again.
+const LOST: u8 = 2;
+
+/// Marks the read-back [`LOST`] if the mapping's callback is dropped without being called, as
+/// it is when the encoder it was asked of is never submitted; otherwise the read-back would wait
+/// for it forever, and the lists never grow again.
+struct MappingCallback {
+    status: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    called: bool,
+}
+
+impl Drop for MappingCallback {
+    fn drop(&mut self) {
+        if !self.called {
+            self.status.store(LOST, std::sync::atomic::Ordering::Release);
+        }
+    }
 }
 
 /// Chooses on the GPU which clusters of which instances to draw: instances and clusters out of
@@ -1349,7 +1372,7 @@ pub struct Culler {
     visible_capacity: u32,
     readback: wgpu::Buffer,
     state: Readback,
-    mapped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mapped: std::sync::Arc<std::sync::atomic::AtomicU8>,
     stats: Option<CullStats>,
     /// The depth pyramid of the frame before, which the culling tests clusters against; and a
     /// texel of one standing in before there is one.
@@ -1541,22 +1564,14 @@ impl Culler {
         self.lists = storage_buffer(device, "YoctiteLists", self.capacity as u64 * LIST_BYTES, wgpu::BufferUsages::empty());
     }
 
-    /// Takes in the counts read back, if they have arrived, and starts reading back the last
-    /// culling's.
+    /// Takes in the counts read back, if they have arrived.
     fn poll(&mut self, device: &wgpu::Device) {
         use std::sync::atomic::Ordering;
         match self.state {
-            Readback::Copied => {
-                let mapped = self.mapped.clone();
-                mapped.store(false, Ordering::Release);
-                self.readback.slice(..).map_async(wgpu::MapMode::Read, move |result| {
-                    if result.is_ok() {
-                        mapped.store(true, Ordering::Release);
-                    }
-                });
-                self.state = Readback::Mapping;
+            Readback::Mapping if self.mapped.load(Ordering::Acquire) == LOST => {
+                self.state = Readback::Idle;
             }
-            Readback::Mapping if self.mapped.load(Ordering::Acquire) => {
+            Readback::Mapping if self.mapped.load(Ordering::Acquire) == MAPPED => {
                 let counts: [u32; COUNTS] = {
                     let data = self.readback.slice(..).get_mapped_range().expect("mapped");
                     bytemuck::pod_read_unaligned(&data[..COUNTS_BYTES as usize])
@@ -1635,10 +1650,26 @@ impl Culler {
         self.material_capacity
     }
 
+    /// Copies the counts into the read-back, if it is free, and has it mapped once `encoder` is
+    /// submitted. Mapping it any sooner - at the next culling, say - goes wrong when a second
+    /// camera culls before the first camera's commands are submitted (a screen showing a
+    /// camera's picture, as Maze's race monitors): wgpu refuses to submit a copy into a buffer
+    /// that is mapped.
     fn copy_counts(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        use std::sync::atomic::Ordering;
         if self.state == Readback::Idle {
             encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, COUNTS_BYTES);
-            self.state = Readback::Copied;
+            self.mapped.store(PENDING, Ordering::Release);
+            let mut callback = MappingCallback {
+                status: self.mapped.clone(),
+                called: false,
+            };
+            encoder.map_buffer_on_submit(&self.readback, wgpu::MapMode::Read, .., move |result| {
+                callback.called = true;
+                let status = if result.is_ok() { MAPPED } else { LOST };
+                callback.status.store(status, Ordering::Release);
+            });
+            self.state = Readback::Mapping;
         }
     }
 
@@ -3328,6 +3359,31 @@ mod test {
             threshold: 0.0005,
             material_slots: 1,
         };
+        // Two cameras culling before either's commands are submitted (a screen showing a
+        // camera's picture): the second must not map the read-back the first is copying into.
+        {
+            let mut first = device.create_command_encoder(&Default::default());
+            let mut second = device.create_command_encoder(&Default::default());
+            let mut other = Culler::new(&device);
+            other.record(&device, &mut first, &pool, &parameters);
+            other.record(&device, &mut second, &pool, &parameters);
+            queue.submit([first.finish(), second.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            // And commands dropped unsubmitted leave the read-back free for the next culling.
+            let mut dropped = device.create_command_encoder(&Default::default());
+            let mut abandoned = Culler::new(&device);
+            abandoned.record(&device, &mut dropped, &pool, &parameters);
+            drop(dropped);
+            let mut next = device.create_command_encoder(&Default::default());
+            abandoned.record(&device, &mut next, &pool, &parameters);
+            queue.submit([next.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            let mut after = device.create_command_encoder(&Default::default());
+            abandoned.record(&device, &mut after, &pool, &parameters);
+            queue.submit([after.finish()]);
+            device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+            assert!(abandoned.stats().is_some(), "read back again after commands were dropped");
+        }
         let cull = |culler: &mut Culler| {
             let mut encoder = device.create_command_encoder(&Default::default());
             culler.record(&device, &mut encoder, &pool, &parameters);
@@ -3339,11 +3395,10 @@ mod test {
         let args: Vec<u32> = read(&device, &queue, &culler.args, 12);
         assert_eq!(args[all + 1], 10, "no more drawn than the list holds");
         assert_eq!(args[8 + 1], 10, "nor by the material");
-        // The counts arrive over the next cullings, and the list grows to hold them.
-        for _ in 0..3 {
-            cull(&mut culler);
-        }
-        let stats = culler.stats().expect("read back by now");
+        // The counts are mapped as the culling's commands are submitted, so they arrive at the next
+        // culling, and the list grows to hold them.
+        cull(&mut culler);
+        let stats = culler.stats().expect("read back by the next culling");
         assert!(stats.overflowed && stats.clusters > 10, "{stats:?}");
         assert!(culler.capacity() >= stats.clusters, "{} for {} clusters", culler.capacity(), stats.clusters);
         cull(&mut culler);
