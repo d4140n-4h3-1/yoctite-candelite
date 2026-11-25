@@ -1,0 +1,15 @@
+[workspace]
+members = ["yoctite", "yoctite-wgpu", "candelite"]
+resolver = "2"
+
+[workspace.dependencies]
+# The engine's wgpu backend and graphics abstractions. Same source and branch as the games use, so
+# Cargo resolves one copy of the engine for everything.
+fyrox-core = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan" }
+fyrox-graphics = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan" }
+fyrox-graphics-wgpu = { git = "https://github.com/d4140n-4h3-1/Hydroxus.git", branch = "vulkan" }
+wgpu = "30.0.0"
+bytemuck = { version = "1", features = ["derive"] }
+half = "2.2.1"
+yoctite = { version = "0.1.0", path = "yoctite" }
+yoctite-wgpu = { version = "0.1.0", path = "yoctite-wgpu" }

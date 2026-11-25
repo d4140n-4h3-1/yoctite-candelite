@@ -1,0 +1,18 @@
+[package]
+name = "yoctite-wgpu"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Yoctite on the GPU: the geometry pool, culling, software rasterizer and G-Buffer pass of Hydroxus's wgpu backend"
+keywords = ["lod", "meshlet", "cluster", "virtual-geometry", "wgpu"]
+categories = ["game-development", "rendering"]
+rust-version = "1.87"
+
+[dependencies]
+yoctite.workspace = true
+fyrox-core.workspace = true
+fyrox-graphics.workspace = true
+fyrox-graphics-wgpu.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+half.workspace = true

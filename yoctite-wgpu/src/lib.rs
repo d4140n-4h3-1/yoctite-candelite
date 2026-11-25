@@ -30,7 +30,7 @@
 //! levels of detail chosen. The GPU will make that list itself, culling and choosing levels of
 //! detail every frame, in the next phase.
 
-use crate::{
+use fyrox_graphics_wgpu::{
     framebuffer::{PendingClear, WgpuFrameBuffer},
     sampler::WgpuSampler,
     server::WgpuGraphicsServer,

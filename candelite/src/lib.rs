@@ -30,10 +30,8 @@
 //! leaves cards whose texture is see-through between them - is traced as one: a ray passes where
 //! the texture is see-through, as the renderer's alpha test leaves it undrawn.
 
-use crate::{
-    raytracing::CutoutMask,
-    yoctite::{Capture, GBufferDrawer, GeometryPool, MeshId, ResolvedMaterial},
-};
+use fyrox_graphics_wgpu::raytracing::CutoutMask;
+use yoctite_wgpu::{Capture, GBufferDrawer, GeometryPool, MeshId, ResolvedMaterial};
 use std::sync::Arc;
 use fyrox_graphics::error::FrameworkError;
 use std::collections::HashMap;
@@ -3881,7 +3879,7 @@ mod test {
         assert!(shelves.allocate(10, 8).is_some());
     }
 
-    use crate::yoctite::{MaterialParams, PoolVertex};
+    use yoctite_wgpu::{MaterialParams, PoolVertex};
 
     fn block_on<F: std::future::Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);

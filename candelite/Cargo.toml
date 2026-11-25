@@ -1,0 +1,20 @@
+[package]
+name = "candelite"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Candelite: dynamic global illumination for Hydroxus - a surface cache of cards, traced on Yoctite's geometry"
+keywords = ["global-illumination", "raytracing", "wgpu"]
+categories = ["game-development", "rendering"]
+rust-version = "1.87"
+
+[dependencies]
+yoctite-wgpu.workspace = true
+fyrox-graphics.workspace = true
+fyrox-graphics-wgpu.workspace = true
+wgpu.workspace = true
+bytemuck.workspace = true
+half.workspace = true
+
+[dev-dependencies]
+yoctite.workspace = true
