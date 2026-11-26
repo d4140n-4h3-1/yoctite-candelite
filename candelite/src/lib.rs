@@ -43,8 +43,10 @@ pub const TEXELS_PER_METER: f32 = 8.0;
 pub const SMALLEST_TILE: u32 = 4;
 /// The most texels a tile has along a side.
 pub const LARGEST_TILE: u32 = 256;
-/// How many cards a mesh has: the six faces of its bounds.
-pub const CARDS_PER_MESH: u32 = 6;
+/// How many cards a mesh has: two on each of the six faces of its bounds (see [`Card::of`]).
+pub const CARDS_PER_MESH: u32 = 12;
+/// How many cards a mesh has, as an array length.
+const CARDS: usize = CARDS_PER_MESH as usize;
 /// A mesh slot's entry in [`SurfaceCache::mesh_cards`] when it has no cards.
 pub const NO_CARDS: u32 = u32::MAX;
 
@@ -105,6 +107,8 @@ pub struct Card {
     pub half_height: f32,
     /// How deep the bounds are along `normal`.
     pub depth: f32,
+    /// Whether it keeps the farthest surface it sees facing it, not the nearest.
+    pub far: bool,
 }
 
 fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
@@ -116,9 +120,18 @@ fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
 }
 
 impl Card {
-    /// The six cards of `bounds`: +x, -x, +y, -y, +z, -z. Bounds flat along an axis are given
-    /// a little depth, so a card never divides by none.
-    pub fn of(bounds: &Bounds) -> [Card; 6] {
+    /// The twelve cards of `bounds`: on its +x, -x, +y, -y, +z and -z faces, each looking in and
+    /// keeping the nearest surface it sees facing it; then the same six keeping the farthest.
+    ///
+    /// The nearest is the outside of a solid thing. But a mesh you go inside - a room, a piece of
+    /// corridor - is seen from within: from outside its bounds, the outsides of its walls stand in
+    /// front of their insides, and the nearest surfaces alone never see the inside at all. The
+    /// farthest surface facing a card is the inside of the wall across from it (of a solid thing,
+    /// its outside again). The far cards' depth runs from a little outside the far side of the
+    /// bounds to a little outside the card's own face, so what they keep is never at the far end of
+    /// their depth, which is where a card that saw nothing is left. Bounds flat along an axis are
+    /// given a little depth, so a card never divides by none.
+    pub fn of(bounds: &Bounds) -> [Card; CARDS] {
         let size: [f32; 3] = std::array::from_fn(|i| (bounds.max[i] - bounds.min[i]).max(1.0e-3));
         let middle: [f32; 3] = std::array::from_fn(|i| (bounds.max[i] + bounds.min[i]) * 0.5);
         let faces: [([f32; 3], usize); 6] = [
@@ -129,7 +142,7 @@ impl Card {
             ([0.0, 0.0, 1.0], 2),
             ([0.0, 0.0, -1.0], 2),
         ];
-        faces.map(|(normal, axis)| {
+        let faces = faces.map(|(normal, axis)| {
             // Up the card is up, unless the card looks along up; then it is along z, turned so
             // that u cross v is the face's normal.
             let v = match axis {
@@ -148,6 +161,20 @@ impl Card {
                 half_width: half(u),
                 half_height: half(v),
                 depth: size[axis],
+                far: false,
+            }
+        });
+        std::array::from_fn(|i| {
+            let card = faces[i % 6];
+            if i < 6 {
+                return card;
+            }
+            let margin = 0.01 + 0.01 * card.depth;
+            Card {
+                center: std::array::from_fn(|k| card.center[k] + card.normal[k] * margin),
+                depth: card.depth + 2.0 * margin,
+                far: true,
+                ..card
             }
         })
     }
@@ -155,14 +182,18 @@ impl Card {
     /// From the mesh's space to the card's clip space (column by column, OpenGL's, as
     /// [`Capture::view_projection`] is): across and up the card from -1 to 1, and in from its face
     /// to the far side of the bounds from -1 to 1 - so the depth stored is how far in, as a share
-    /// of [`Self::depth`].
+    /// of [`Self::depth`]. A far card's runs the other way, from its far side (-1) to its face (1),
+    /// so that the depth test keeps the farthest; the depth stored is then one less how far in.
     pub fn view_projection(&self) -> [[f32; 4]; 4] {
         let (u, v, n) = (self.u, self.v, self.normal);
         let row_x = [u[0] / self.half_width, u[1] / self.half_width, u[2] / self.half_width, -dot(self.center, u) / self.half_width];
         let row_y = [v[0] / self.half_height, v[1] / self.half_height, v[2] / self.half_height, -dot(self.center, v) / self.half_height];
         // Clip z: 2 d / depth - 1, where d = (center - p) . n is how far in p is.
         let k = 2.0 / self.depth;
-        let row_z = [-k * n[0], -k * n[1], -k * n[2], k * dot(self.center, n) - 1.0];
+        let mut row_z = [-k * n[0], -k * n[1], -k * n[2], k * dot(self.center, n) - 1.0];
+        if self.far {
+            row_z = row_z.map(|c| -c);
+        }
         let rows = [row_x, row_y, row_z, [0.0, 0.0, 0.0, 1.0]];
         std::array::from_fn(|column| std::array::from_fn(|row| rows[row][column]))
     }
@@ -178,7 +209,8 @@ impl Card {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct GpuCard {
-    /// The middle of its face, in the mesh's own space, and the bounds' depth along its normal.
+    /// The middle of its face, in the mesh's own space, and the bounds' depth along its normal:
+    /// negative for a far card (see [`Card::of`]).
     pub center: [f32; 4],
     /// Across it, and half its width.
     pub u: [f32; 4],
@@ -272,7 +304,7 @@ impl ShelfAllocator {
 #[derive(Debug, Clone, PartialEq)]
 struct Carded {
     first_card: u32,
-    tiles: [[u32; 4]; 6],
+    tiles: [[u32; 4]; CARDS],
 }
 
 /// Every mesh's cards, and the atlas they are captured into: see the module's description.
@@ -282,7 +314,7 @@ pub struct SurfaceCache {
     depth: wgpu::Texture,
     shelves: ShelfAllocator,
     cards: Vec<GpuCard>,
-    /// Runs of six cards given back, by their first.
+    /// Runs of [`CARDS_PER_MESH`] cards given back, by their first.
     free_cards: Vec<u32>,
     mesh_cards: Vec<u32>,
     meshes: HashMap<u32, Carded>,
@@ -335,7 +367,7 @@ impl SurfaceCache {
             return Some(Vec::new());
         }
         let cards = Card::of(bounds);
-        let mut tiles = [[0u32; 4]; 6];
+        let mut tiles = [[0u32; 4]; CARDS];
         for (i, card) in cards.iter().enumerate() {
             let [w, h] = card.tile_size();
             match self.shelves.allocate(w, h) {
@@ -355,7 +387,7 @@ impl SurfaceCache {
         });
         for (i, (card, tile)) in cards.iter().zip(tiles).enumerate() {
             self.cards[first_card as usize + i] = GpuCard {
-                center: [card.center[0], card.center[1], card.center[2], card.depth],
+                center: [card.center[0], card.center[1], card.center[2], if card.far { -card.depth } else { card.depth }],
                 u: [card.u[0], card.u[1], card.u[2], card.half_width],
                 v: [card.v[0], card.v[1], card.v[2], card.half_height],
                 tile,
@@ -446,7 +478,7 @@ impl SurfaceCache {
         &self.mesh_cards
     }
 
-    /// Every card, six to a mesh.
+    /// Every card, [`CARDS_PER_MESH`] to a mesh.
     pub fn cards(&self) -> &[GpuCard] {
         &self.cards
     }
@@ -824,6 +856,13 @@ fn candelite_linear(c: vec3f) -> vec3f {
 // linear, but no brighter in its brightest channel than MOST_ALBEDO - scaled down whole, so its
 // hue is kept. See `MOST_ALBEDO`.
 const CANDELITE_MOST_ALBEDO: f32 = 0.8;
+const CANDELITE_CARDS_PER_MESH: u32 = 12u;
+
+// How far in from its face, in meters, what `card` saw at a texel of depth `share` is: a far card
+// (its depth negative) stores one less its share of the way in (see `Card::of`).
+fn candelite_card_in(card: CandeliteCard, share: f32) -> f32 {
+    return select(share, 1.0 - share, card.center.w < 0.0) * abs(card.center.w);
+}
 fn candelite_albedo(c: vec3f) -> vec3f {
     let a = candelite_linear(c);
     return a * min(1.0, CANDELITE_MOST_ALBEDO / max(max(a.r, a.g), max(a.b, 1.0e-6)));
@@ -964,7 +1003,7 @@ fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
     var near_diffuse = vec3f(0.0);
     var near_normal = vec3f(0.0);
     var near_weight = 0.0;
-    for (var c = 0u; c < 6u; c++) {
+    for (var c = 0u; c < CANDELITE_CARDS_PER_MESH; c++) {
         let card = candeliteCards[first + c];
         let u = card.u.xyz;
         let v = card.v.xyz;
@@ -1000,7 +1039,7 @@ fn candelite_trace(origin: vec3f, direction: vec3f, reach: f32) -> SurfaceHit {
         }
         let texel_diffuse = textureLoad(candeliteDiffuse, texel, 0).rgb * facing;
         let texel_normal = (textureLoad(candeliteNormal, texel, 0).xyz * 2.0 - 1.0) * facing;
-        if (abs(share * card.center.w + dot(local, n)) > CANDELITE_DEPTH_SLACK) {
+        if (abs(candelite_card_in(card, share) + dot(local, n)) > CANDELITE_DEPTH_SLACK) {
             near_diffuse += texel_diffuse;
             near_normal += texel_normal;
             near_weight += facing;
@@ -1216,7 +1255,7 @@ struct Lit {
     first: u32,
     mesh: u32,
     level: u32,
-    tiles: [[u32; 4]; 6],
+    tiles: [[u32; 4]; CARDS],
 }
 
 const LIGHT_SHADER: &str = r#"
@@ -1277,7 +1316,7 @@ fn light_cards(@builtin(global_invocation_id) id: vec3u) {
     let s = uv.x * 2.0 - 1.0;
     let t = 1.0 - uv.y * 2.0;
     let n = cross(card.u.xyz, card.v.xyz);
-    let p = card.center.xyz + card.u.xyz * (s * card.u.w) + card.v.xyz * (t * card.v.w) - n * (share * card.center.w);
+    let p = card.center.xyz + card.u.xyz * (s * card.u.w) + card.v.xyz * (t * card.v.w) - n * candelite_card_in(card, share);
     let m = instance.transform;
     let world = vec3f(dot(m[0], vec4f(p, 1.0)), dot(m[1], vec4f(p, 1.0)), dot(m[2], vec4f(p, 1.0)));
     let captured = textureLoad(candeliteNormal, at, 0).xyz * 2.0 - 1.0;
@@ -1494,7 +1533,7 @@ impl SurfaceLight {
                 continue;
             }
             let first_card = mesh_cards[mesh as usize] as usize;
-            let mut tiles = [[0u32; 4]; 6];
+            let mut tiles = [[0u32; 4]; CARDS];
             let mut placed = 0;
             for (face, tile) in tiles.iter_mut().enumerate() {
                 let [_, _, w, h] = cache.cards()[first_card + face].tile;
@@ -1507,7 +1546,7 @@ impl SurfaceLight {
                     None => break,
                 }
             }
-            if placed < 6 {
+            if placed < CARDS {
                 for tile in &tiles[..placed] {
                     self.shelves.free([tile[0], tile[1]], tile[2], tile[3]);
                 }
@@ -1516,7 +1555,7 @@ impl SurfaceLight {
             }
             let first = self.free_lit.pop().unwrap_or_else(|| {
                 let first = self.lit_cards.len() as u32;
-                self.lit_cards.resize(self.lit_cards.len() + 6, GpuLitCard::default());
+                self.lit_cards.resize(self.lit_cards.len() + CARDS, GpuLitCard::default());
                 first
             });
             for (face, tile) in tiles.iter().enumerate() {
@@ -1555,7 +1594,7 @@ impl SurfaceLight {
 
     /// The tiles of the lit cards of the instance in `slot`, in the radiance atlas, if it has
     /// any: x, y, width and height in texels.
-    pub fn lit_tiles(&self, slot: u32) -> Option<[[u32; 4]; 6]> {
+    pub fn lit_tiles(&self, slot: u32) -> Option<[[u32; 4]; CARDS]> {
         self.lit.get(&slot).map(|lit| lit.tiles)
     }
 
@@ -1730,7 +1769,7 @@ impl SurfaceLight {
     /// until `blocks` holds `budget`: [`None`] if the run was finished, else how far it got.
     fn texels_of(&self, first: u32, from: u32, budget: usize, blocks: &mut Vec<[u32; 2]>) -> Option<u32> {
         let mut at = 0u32;
-        for face in 0..6 {
+        for face in 0..CARDS_PER_MESH {
             let card = first + face;
             let tile = self.lit_cards[card as usize].tile;
             let count = tile[2] * tile[3];
@@ -2278,7 +2317,8 @@ struct Probes {
     size: vec2u,
     grid: vec2u,
     frame: u32,
-    pad0: u32,
+    // What the light given to the renderer is multiplied by (see `ScreenProbes::set_strength`).
+    strength: f32,
     pad1: u32,
     pad2: u32,
 };
@@ -2552,7 +2592,7 @@ fn fs_main(@builtin(position) at: vec4f) -> Gathered {
     let pixel = vec2u(at.xy);
     let depth = textureLoad(sceneDepth, pixel, 0);
     if (depth >= 1.0) {
-        return Gathered(vec4f(probes.sky.rgb, 1.0), vec4f(probes.sky.rgb, 0.0));
+        return Gathered(vec4f(probes.sky.rgb * probes.strength, 1.0), vec4f(probes.sky.rgb, 0.0));
     }
     let p = probes_unproject(at.xy, depth);
     let n = probes_normal(pixel);
@@ -2596,7 +2636,7 @@ fn fs_main(@builtin(position) at: vec4f) -> Gathered {
             light = mix(had, now, GATHER_NEW);
         }
     }
-    return Gathered(vec4f(light, 1.0), vec4f(light, range));
+    return Gathered(vec4f(light * probes.strength, 1.0), vec4f(light, range));
 }
 "#;
 
@@ -2624,6 +2664,8 @@ pub struct ScreenProbes {
     previous_eye: Option<[f32; 3]>,
     previous_view_projection: Option<[[f32; 4]; 4]>,
     frame: u32,
+    /// See [`Self::set_strength`].
+    strength: f32,
 }
 
 /// What [`ScreenProbes::record`] needs of the frame.
@@ -2644,6 +2686,19 @@ pub struct ProbeFrame<'a> {
 }
 
 impl ScreenProbes {
+    /// Multiplies the light drawn for the renderer by `strength` (1 by default): to light a scene
+    /// whose lamps were set for no light between surfaces at all - which a closed, pale corridor
+    /// lit lamp after lamp has a great deal of - as its maker meant, and keep its shadows. Only
+    /// what the renderer is given: the light kept from frame to frame, and that bounced, are not.
+    pub fn set_strength(&mut self, strength: f32) {
+        self.strength = strength.max(0.0);
+    }
+
+    /// See [`Self::set_strength`].
+    pub fn strength(&self) -> f32 {
+        self.strength
+    }
+
     /// The probes' pipelines; [`None`] if `device` cannot trace rays.
     pub fn new(device: &wgpu::Device) -> Option<Self> {
         if !can_trace(device) {
@@ -2748,6 +2803,7 @@ impl ScreenProbes {
         });
         Some(Self {
             gathered: None,
+            strength: 1.0,
             previous_eye: None,
             lookup_layout,
             trace_layout,
@@ -2830,7 +2886,8 @@ impl ScreenProbes {
             size: [u32; 2],
             grid: [u32; 2],
             frame: u32,
-            _padding: [u32; 3],
+            strength: f32,
+            _padding: [u32; 2],
         }
         let four = |v: [f32; 3]| [v[0], v[1], v[2], 0.0];
         let uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -2846,7 +2903,8 @@ impl ScreenProbes {
                 size,
                 grid,
                 frame: self.frame,
-                _padding: [0; 3],
+                strength: self.strength,
+                _padding: [0; 2],
             }),
             usage: wgpu::BufferUsages::UNIFORM,
         });
@@ -3458,6 +3516,9 @@ pub enum ViewShows {
     /// The light leaving what was hit: from its lit cards, or lit where it is (see
     /// [`SurfaceLight`]); brought into range by x / (1 + x).
     Lit,
+    /// Whether the cards cover what was hit: green where one saw that very surface, yellow where
+    /// they saw only something near it (lit where it is), magenta where they saw nothing there.
+    Covered,
 }
 
 const VIEW_SHADER: &str = r#"
@@ -3504,6 +3565,9 @@ fn fs_main(@builtin(position) at: vec4f) -> @location(0) vec4f {
         }
         case 2u: {
             return vec4f(hit.normal * 0.5 + 0.5, 1.0);
+        }
+        case 4u: {
+            return select(vec4f(1.0, 1.0, 0.0, 1.0), vec4f(0.0, 1.0, 0.0, 1.0), hit.covered);
         }
         default: {
             let light = 0.35 + 0.65 * max(dot(hit.normal, normalize(vec3f(0.3, 1.0, 0.2))), 0.0);
@@ -3623,6 +3687,7 @@ impl SurfaceView {
                     ViewShows::Shaded => 1,
                     ViewShows::Normal => 2,
                     ViewShows::Lit => 3,
+                    ViewShows::Covered => 4,
                 },
                 size: [target.width() as f32, target.height() as f32],
                 _padding: [0.0; 2],
@@ -3845,11 +3910,13 @@ mod test {
             max: [2.0, 5.0, 1.0],
         };
         let cards = Card::of(&bounds);
-        for card in &cards {
+        for (i, card) in cards.iter().enumerate() {
+            assert_eq!(card.far, i >= 6, "near cards first, then far: {card:?}");
             let n = cross(card.u, card.v);
             assert_eq!(n, card.normal, "u cross v is the normal: {card:?}");
             let m = card.view_projection();
-            // Every corner of the bounds is in view, from the face (z -1) to the far side (z 1).
+            // Every corner of the bounds is in view: a near card's from the face (z -1) to the far
+            // side (z 1); a far card's the other way, and short of either end.
             let mut z_range = (f32::MAX, f32::MIN);
             for k in 0..8 {
                 let corner = [0, 1, 2].map(|i| if k & (1 << i) != 0 { bounds.max[i] } else { bounds.min[i] });
@@ -3857,13 +3924,24 @@ mod test {
                 assert!(p.iter().all(|c| (-1.0001..=1.0001).contains(c)), "{card:?}: {corner:?} at {p:?}");
                 z_range = (z_range.0.min(p[2]), z_range.1.max(p[2]));
             }
-            assert!((z_range.0 + 1.0).abs() < 1.0e-4 && (z_range.1 - 1.0).abs() < 1.0e-4, "{z_range:?}");
-            // The face's middle at the near plane's middle.
-            let p = transform(&m, card.center);
-            assert!(p.iter().zip([0.0, 0.0, -1.0]).all(|(a, b)| (a - b).abs() < 1.0e-5), "{p:?}");
-            // A point just inside the face, towards the bounds, is a little farther.
-            let inside = [0, 1, 2].map(|i| card.center[i] - card.normal[i] * 0.1);
-            assert!(transform(&m, inside)[2] > -1.0);
+            // A point just inside the face, towards the bounds, is a little farther - for a far
+            // card, a little nearer to its end of the depth.
+            let face = cards[i % 6].center;
+            let inside = [0, 1, 2].map(|i| face[i] - card.normal[i] * 0.1);
+            let (at_face, in_a_little) = (transform(&m, face)[2], transform(&m, inside)[2]);
+            if card.far {
+                assert!(z_range.0 > -0.999 && z_range.1 < 0.999, "{card:?}: {z_range:?}");
+                assert!(in_a_little < at_face, "{card:?}");
+                // Its stored depth brought back to how far in: the face 0, the far side its depth.
+                let back = |z: f32| (1.0 - (z * 0.5 + 0.5)) * card.depth - (card.depth - cards[i % 6].depth) * 0.5;
+                assert!(back(at_face).abs() < 1.0e-4 && (back(z_range.0) - cards[i % 6].depth).abs() < 1.0e-4, "{card:?}");
+            } else {
+                assert!((z_range.0 + 1.0).abs() < 1.0e-4 && (z_range.1 - 1.0).abs() < 1.0e-4, "{z_range:?}");
+                // The face's middle at the near plane's middle.
+                let p = transform(&m, card.center);
+                assert!(p.iter().zip([0.0, 0.0, -1.0]).all(|(a, b)| (a - b).abs() < 1.0e-5), "{p:?}");
+                assert!(in_a_little > at_face);
+            }
         }
         // The top card's tile: 3 by 4 meters at 8 texels a meter.
         assert_eq!(cards[2].tile_size(), [24, 32]);
@@ -3981,7 +4059,7 @@ mod test {
         let middle: [f32; 3] = std::array::from_fn(|i| (min[i] + max[i]) * 0.5);
         let half: [f32; 3] = std::array::from_fn(|i| (max[i] - min[i]) * 0.5);
         let (mut vertices, mut indices) = (Vec::new(), Vec::new());
-        for card in Card::of(&Bounds { min, max }) {
+        for card in Card::of(&Bounds { min, max }).into_iter().filter(|card| !card.far) {
             if top_only && card.normal != [0.0, 1.0, 0.0] {
                 continue;
             }
@@ -4219,6 +4297,96 @@ mod test {
         // Through the card's drawn half, the card; through its see-through half, the box behind.
         assert_eq!(diffuse[at(30, SIZE / 2)].to_le_bytes(), [64, 128, 255, 255], "the card's drawn half");
         assert_eq!(diffuse[at(34, SIZE / 2)].to_le_bytes(), [255, 128, 64, 255], "the box, through the card");
+    }
+
+    #[test]
+    fn the_cards_cover_the_inside_of_a_corridor_of_two_sided_panels() {
+        // One piece of a corridor 4 m wide and long and 6 m high, as Maze's tiles are made: floor,
+        // ceiling and two walls, each panel seen from both sides, all one mesh. Cards looking in
+        // from outside its bounds see the outsides of the panels, in front of their insides; the
+        // inside - all anyone in the corridor sees - is to be covered all the same.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let Some(adapter) = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            eprintln!("no ray tracing: skipped");
+            return;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }))
+        .expect("device");
+        let (mut vertices, mut indices) = (Vec::new(), Vec::new());
+        for (corner, a, b) in [
+            ([-2.0, 0.0, -2.0], [0.0, 0.0, 4.0], [4.0, 0.0, 0.0]),
+            ([-2.0, 6.0, -2.0], [4.0, 0.0, 0.0], [0.0, 0.0, 4.0]),
+            ([-2.0, 0.0, -2.0], [4.0, 0.0, 0.0], [0.0, 6.0, 0.0]),
+            ([-2.0, 0.0, 2.0], [0.0, 6.0, 0.0], [4.0, 0.0, 0.0]),
+        ] {
+            let (v, i) = two_sided_quad(corner, a, b);
+            let first = vertices.len() as u32;
+            vertices.extend(v);
+            indices.extend(i.into_iter().map(|i| i + first));
+        }
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut scene = TraceScene::new();
+        let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+        let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+        let first = pool.mesh(mesh).unwrap().first_cluster;
+        let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
+        let captures = cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, 0).expect("room");
+        scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
+        pool.add_instance(&device, &queue, mesh, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0);
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let materials = [ResolvedMaterial {
+            slot: 0,
+            params: MaterialParams::default(),
+            views: [white.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [white.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        }];
+        let mut drawer = GBufferDrawer::new(&device);
+        let view = SurfaceView::new(&device).expect("can trace");
+        let mut light = SurfaceLight::new(&device).expect("can trace");
+        let sunlight = Sunlight { toward_sun: [0.0, 1.0, 0.0], sun: [0.0; 3], sky: [0.0; 3] };
+        const SIZE: u32 = 64;
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: VIEW_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let eye = [0.0, 3.0, 0.0];
+        // 90 degrees across, looking at a wall (down -z), at the floor (down -y) and at the
+        // ceiling (up +y): screen x along +x each time.
+        let looks = [
+            ("wall", [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0; 4], [eye[0], eye[1], eye[2] - 1.0, 1.0]]),
+            ("floor", [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, -1.0, 0.0], [0.0; 4], [eye[0], eye[1] - 1.0, eye[2], 1.0]]),
+            ("ceiling", [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0; 4], [eye[0], eye[1] + 1.0, eye[2], 1.0]]),
+        ];
+        for (what, inverse) in looks {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
+            assert!(scene.update(&device, &mut encoder, &pool));
+            view.record(&device, &mut encoder, &mut scene, &pool, &mut cache, &mut light, &sunlight, inverse, eye, ViewShows::Covered, &target);
+            queue.submit([encoder.finish()]);
+            let seen = texels(&device, &queue, &target, wgpu::TextureAspect::All, 4);
+            let hits = seen.iter().filter(|&&t| t != 0).count();
+            let covered = seen.iter().filter(|&&t| t.to_le_bytes() == [0, 255, 0, 255]).count();
+            assert!(hits > (SIZE * SIZE) as usize / 2, "{what}: hit {hits} of {} pixels", SIZE * SIZE);
+            assert!(covered * 100 >= hits * 99, "{what}: the cards cover {covered} of {hits} hits");
+        }
     }
 
     #[test]
@@ -4479,7 +4647,7 @@ mod test {
         }))
         .ok()?;
         let mut pool = GeometryPool::new(&device, 1 << 10);
-        let mut cache = SurfaceCache::new(&device, 256);
+        let mut cache = SurfaceCache::new(&device, 512);
         let mut scene = TraceScene::new();
         let mut captures = Vec::new();
         let mut slots = Vec::new();
