@@ -488,6 +488,15 @@ struct CutoutRecord {
 /// walking (8 k instances of Wilderness's 16 k are left; with 0.5 m, still the stalls).
 pub const TRACE_LEAST: f32 = 1.0;
 
+/// The most of the light falling on a surface that a bounce takes it to give back, in its
+/// brightest channel (`candelite_albedo` in [`LOOKUP_WGSL`], which keeps its own copy): a whiter
+/// surface is taken to be this white, its hue kept. Nothing real is whiter - fresh snow is about
+/// 0.9 - and a surface giving back all the light on it keeps every bounce: in a closed room, such
+/// as a corridor of a maze whose walls are pure white (as a glTF material with no base colour
+/// is), the light between surfaces built up without end, frame after frame, until it washed out
+/// everything.
+pub const MOST_ALBEDO: f32 = 0.8;
+
 /// What Candelite traces rays against: every mesh of the pool given its triangles, and every
 /// instance placed in the pool at least [`TRACE_LEAST`] big, naming its slot (see the module's
 /// description).
@@ -811,6 +820,15 @@ fn candelite_linear(c: vec3f) -> vec3f {
     return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3f(2.4)), step(vec3f(0.04045), c));
 }
 
+// How much of the light falling on a surface it gives back, as a bounce sees it: its colour (sRGB)
+// linear, but no brighter in its brightest channel than MOST_ALBEDO - scaled down whole, so its
+// hue is kept. See `MOST_ALBEDO`.
+const CANDELITE_MOST_ALBEDO: f32 = 0.8;
+fn candelite_albedo(c: vec3f) -> vec3f {
+    let a = candelite_linear(c);
+    return a * min(1.0, CANDELITE_MOST_ALBEDO / max(max(a.r, a.g), max(a.b, 1.0e-6)));
+}
+
 fn candelite_unpack(packed: vec2u) -> vec4f {
     return vec4f(unpack2x16float(packed.x), unpack2x16float(packed.y));
 }
@@ -1046,7 +1064,7 @@ fn candelite_hit_light(hit: SurfaceHit, toward_sun: vec3f, sun: vec3f, sky: vec3
         return sky;
     }
     if (hit.lit) {
-        return hit.radiance + candelite_linear(hit.diffuse) * candelite_lamps_on(hit.position, hit.normal);
+        return hit.radiance + candelite_albedo(hit.diffuse) * candelite_lamps_on(hit.position, hit.normal);
     }
     if (!hit.seen) {
         return vec3f(0.0);
@@ -1056,7 +1074,7 @@ fn candelite_hit_light(hit: SurfaceHit, toward_sun: vec3f, sun: vec3f, sky: vec3
     if (facing > 0.0 && !candelite_blocked(hit.position + hit.normal * 0.05 + toward_sun * 0.15, toward_sun, 1.0e4)) {
         light += sun * facing;
     }
-    return candelite_linear(hit.diffuse) * light;
+    return candelite_albedo(hit.diffuse) * light;
 }
 
 // The lamps' light falling on a white surface at `position` facing `normal`, where a shadow ray
@@ -1264,7 +1282,7 @@ fn light_cards(@builtin(global_invocation_id) id: vec3u) {
     let world = vec3f(dot(m[0], vec4f(p, 1.0)), dot(m[1], vec4f(p, 1.0)), dot(m[2], vec4f(p, 1.0)));
     let captured = textureLoad(candeliteNormal, at, 0).xyz * 2.0 - 1.0;
     let normal = normalize(vec3f(dot(m[0].xyz, captured), dot(m[1].xyz, captured), dot(m[2].xyz, captured)));
-    let albedo = candelite_linear(textureLoad(candeliteDiffuse, at, 0).rgb);
+    let albedo = candelite_albedo(textureLoad(candeliteDiffuse, at, 0).rgb);
     // How much of the light on its back comes through (a leaf's), as the G-Buffer has it.
     let through = 1.0 - textureLoad(candeliteMaterial, at, 0).a;
 
@@ -1915,7 +1933,7 @@ fn update_cache(@builtin(workgroup_id) group: vec3u, @builtin(local_invocation_i
         light = candelite_hit_light(hit, update.towardSun.xyz, update.sun.xyz, update.sky.xyz);
     } else {
         let facing = max(dot(hit.normal, update.towardSun.xyz), 0.0);
-        light = candelite_linear(hit.diffuse) * (update.sky.xyz * 0.5 + update.sun.xyz * facing * 0.5);
+        light = candelite_albedo(hit.diffuse) * (update.sky.xyz * 0.5 + update.sun.xyz * facing * 0.5);
     }
     let stored = cells[job];
     let fresh = any(stored.xyz != cell) || stored.w == 0;
@@ -4294,9 +4312,10 @@ mod test {
         let row = h / 2;
         let lit = at(w * 7 / 8, row);
         let shaded = at(w / 8, row);
-        // In the sun: its colour, linear (sRGB 0.5 is 0.214, 0.25 is 0.051), the sun a white
-        // surface gives off as 1.
-        assert!((lit[0] - 1.0).abs() < 0.05 && (lit[1] - 0.214).abs() < 0.03 && (lit[2] - 0.051).abs() < 0.02, "lit {lit:?}");
+        // In the sun: its colour, linear (sRGB 0.5 is 0.214, 0.25 is 0.051) - its red full, so
+        // taken down to MOST_ALBEDO, its hue kept - the sun a white surface gives off as 1.
+        let k = MOST_ALBEDO;
+        assert!((lit[0] - k).abs() < 0.05 && (lit[1] - 0.214 * k).abs() < 0.03 && (lit[2] - 0.051 * k).abs() < 0.02, "lit {lit:?}");
         // In the slab's shade, with no sky: only light bounced off the lit floor and the slab's
         // underside, far less.
         assert!(shaded[0] < 0.2 * lit[0], "shaded {shaded:?}, lit {lit:?}");
@@ -4419,11 +4438,11 @@ mod test {
             let m = seen[(SIZE / 2 * SIZE + SIZE / 2) as usize].to_le_bytes();
             [m[0], m[1], m[2]]
         };
-        // The floor's orange (linear 1, 0.214, 0.051) under the lamp's light, falling off a little
-        // over half a meter of its four, brought into range.
+        // The floor's orange (linear 1, 0.214, 0.051, taken down to MOST_ALBEDO) under the lamp's
+        // light, falling off a little over half a meter of its four, brought into range.
         let falloff = 1.0 - 0.25 / 16.0;
         let expected = [1.0f32, 0.214, 0.051].map(|c| {
-            let c = c * falloff;
+            let c = c * MOST_ALBEDO * falloff;
             (c / (1.0 + c) * 255.0).round() as u8
         });
         let lit = middle(&mut light);
@@ -4441,6 +4460,180 @@ mod test {
         light.set_lamps(&[Lamp { spot: Some(([0.0, -1.0, 0.0], 0.8, 0.9)), ..lamp }]);
         let down = middle(&mut light);
         assert!((0..3).all(|i| down[i].abs_diff(lit[i]) <= 2), "spot pointed down: {down:?}, lit {lit:?}");
+    }
+
+    /// The brightest light bounced onto the cards of a room of `meshes`, every 100 frames over
+    /// 400, lit only by a lamp in its middle (0, 1.5, 0) reaching past its corners, its surfaces
+    /// all of the sRGB grey `grey`. None without ray tracing.
+    fn bounced_in_a_room(meshes: Vec<(Vec<PoolVertex>, Vec<u32>)>, grey: f32) -> Option<Vec<f32>> {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default())).ok()?;
+        if !adapter.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {
+            return None;
+        }
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::EXPERIMENTAL_RAY_QUERY,
+            required_limits: adapter.limits(),
+            experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
+            ..Default::default()
+        }))
+        .ok()?;
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut scene = TraceScene::new();
+        let mut captures = Vec::new();
+        let mut slots = Vec::new();
+        for (vertices, indices) in meshes {
+            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+            let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            let first = pool.mesh(mesh).unwrap().first_cluster;
+            let full: Vec<u32> = (0..dag.clusters.len() as u32).filter(|&i| dag.clusters[i as usize].level == 0).map(|i| first + i).collect();
+            captures.extend(cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &full, 0).expect("room"));
+            scene.add_mesh(&device, &queue, mesh, &positions, &indices, None);
+            pool.add_instance(&device, &queue, mesh, [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0], 0);
+            slots.push(slots.len() as u32);
+        }
+        let white = swatch(&device, &queue, [255; 4]);
+        let flat = swatch(&device, &queue, [128, 128, 255, 255]);
+        let materials = [ResolvedMaterial {
+            slot: 0,
+            params: MaterialParams { diffuse_color: [grey, grey, grey, 1.0], ..Default::default() },
+            views: [white.0.clone(), flat.0.clone(), white.0.clone(), white.0.clone(), white.0.clone(), white.0.clone()],
+            samplers: [white.1.clone(), flat.1.clone(), white.1.clone(), white.1.clone(), white.1.clone(), white.1.clone()],
+        }];
+        let mut drawer = GBufferDrawer::new(&device);
+        let mut light = SurfaceLight::new(&device)?;
+        let sunlight = Sunlight { toward_sun: [0.0, 1.0, 0.0], sun: [0.0; 3], sky: [0.0; 3] };
+        light.set_lamps(&[Lamp { position: [0.0, 1.5, 0.0], reach: 10.0, light: [1.0; 3], spot: None }]);
+        let eye = [0.0, 1.5, 1.0];
+        let mut encoder = device.create_command_encoder(&Default::default());
+        cache.record(&device, &mut encoder, &mut drawer, &pool, &captures, &materials).expect("captured");
+        assert!(scene.update(&device, &mut encoder, &pool));
+        queue.submit([encoder.finish()]);
+        let brightest = |light: &SurfaceLight| -> f32 {
+            let staging = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: light.radiance().size(),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let mut encoder = device.create_command_encoder(&Default::default());
+            encoder.copy_buffer_to_buffer(light.radiance(), 0, &staging, 0, light.radiance().size());
+            queue.submit([encoder.finish()]);
+            staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            let _ = device.poll(wgpu::PollType::wait_indefinitely());
+            let words: Vec<u32> = bytemuck::cast_slice(&staging.slice(..).get_mapped_range().unwrap()).to_vec();
+            let half = |h: u32| half::f16::from_bits(h as u16).to_f32();
+            let mut most = 0.0f32;
+            for tile in slots.iter().flat_map(|&slot| light.lit_tiles(slot).expect("lit")) {
+                for y in 0..tile[3] {
+                    for x in 0..tile[2] {
+                        let i = ((tile[1] + y) * RADIANCE_SIZE + tile[0] + x) as usize * 2;
+                        let r = half(words[i] & 0xFFFF);
+                        most = most.max(if r.is_finite() { r } else { f32::INFINITY });
+                    }
+                }
+            }
+            most
+        };
+        let mut seen = Vec::new();
+        for frame in 1..=400 {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            light.update(&device, &mut encoder, &mut scene, &pool, &mut cache, eye, &sunlight);
+            queue.submit([encoder.finish()]);
+            if frame % 100 == 0 {
+                seen.push(brightest(&light));
+            }
+        }
+        Some(seen)
+    }
+
+    // What the cards keep is the light bounced off what the lamp lights (the lamp's own is worked
+    // out where a ray hits). The lamp lights a white surface with at most 1, so no surface gives
+    // off more than 0.8 of it (MOST_ALBEDO, for the whitest); each bounce after keeps 0.8 of what
+    // came before, so all the bounces together come to at most 0.8 * 0.8 / (1 - 0.8) = 3.2 - and
+    // it settles, rather than growing.
+    fn assert_bounded(what: &str, seen: &[f32]) {
+        eprintln!("{what}: brightest bounced light on the cards, every 100 frames: {seen:?}");
+        assert!(seen.iter().all(|&b| b <= 3.2), "{what}: more light than the bounces can give: {seen:?}");
+        assert!(seen[3] <= seen[1] * 1.25 + 1.0e-3, "{what}: still growing: {seen:?}");
+    }
+
+    #[test]
+    fn a_lamp_lights_a_room_of_slabs_no_more_than_its_bounces_can() {
+        // A closed room 4 m square and 3 m high inside, of six slabs 0.2 m thick.
+        let t = 0.2;
+        let slabs = [
+            ([-2.0 - t, -t, -2.0 - t], [2.0 + t, 0.0, 2.0 + t]),
+            ([-2.0 - t, 3.0, -2.0 - t], [2.0 + t, 3.0 + t, 2.0 + t]),
+            ([-2.0 - t, 0.0, -2.0 - t], [-2.0, 3.0, 2.0 + t]),
+            ([2.0, 0.0, -2.0 - t], [2.0 + t, 3.0, 2.0 + t]),
+            ([-2.0, 0.0, -2.0 - t], [2.0, 3.0, -2.0]),
+            ([-2.0, 0.0, 2.0], [2.0, 3.0, 2.0 + t]),
+        ];
+        // sRGB 0.906 is linear 0.8.
+        let Some(seen) = bounced_in_a_room(slabs.iter().map(|&(min, max)| boxed(min, max, false)).collect(), 0.906) else {
+            eprintln!("no ray tracing: skipped");
+            return;
+        };
+        assert_bounded("slabs", &seen);
+        // Pure white - as a glTF material with no base colour is: taken to give back MOST_ALBEDO
+        // of the light, it settles too, where every bounce keeping all of it, in a room nothing
+        // gets out of, built up without end.
+        let Some(white) = bounced_in_a_room(slabs.iter().map(|&(min, max)| boxed(min, max, false)).collect(), 1.0) else {
+            return;
+        };
+        assert_bounded("white slabs", &white);
+    }
+
+    /// A flat rectangle from `corner` along `a` and `b`, seen from both sides: each triangle with
+    /// a twin facing the other way, as fyrox-gfx's `make_double_sided` gives a model's faces.
+    fn two_sided_quad(corner: [f32; 3], a: [f32; 3], b: [f32; 3]) -> (Vec<PoolVertex>, Vec<u32>) {
+        let normal = {
+            let n = [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+            let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            n.map(|c| c / len)
+        };
+        let mut vertices = Vec::new();
+        for flip in [1.0f32, -1.0] {
+            for (s, t) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                vertices.push(PoolVertex {
+                    position: std::array::from_fn(|i| corner[i] + a[i] * s + b[i] * t),
+                    normal: normal.map(|c| c * flip),
+                    uv: [s, t],
+                    tangent: [a[0], a[1], a[2], 1.0],
+                });
+            }
+        }
+        (vertices, vec![0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6])
+    }
+
+    #[test]
+    fn a_lamp_lights_a_white_corridor_of_two_sided_panels_no_more_than_its_bounces_can() {
+        // Three pieces of a corridor 4 m wide and 6 m high along x, as Maze's tiles are made:
+        // floor, ceiling and the two walls each a panel of its own, seen from both sides - and
+        // white, as a glTF material with no base colour is. Every bounce keeping all of the light,
+        // little of it getting out the corridor's ends, the light built up frame after frame
+        // without end; taken to give back MOST_ALBEDO of it, the light settles.
+        let mut panels = Vec::new();
+        for i in -1..=1 {
+            let x = i as f32 * 4.0 - 2.0;
+            panels.push(two_sided_quad([x, 0.0, -2.0], [0.0, 0.0, 4.0], [4.0, 0.0, 0.0]));
+            panels.push(two_sided_quad([x, 6.0, -2.0], [4.0, 0.0, 0.0], [0.0, 0.0, 4.0]));
+            panels.push(two_sided_quad([x, 0.0, -2.0], [4.0, 0.0, 0.0], [0.0, 6.0, 0.0]));
+            panels.push(two_sided_quad([x, 0.0, 2.0], [0.0, 6.0, 0.0], [4.0, 0.0, 0.0]));
+        }
+        let Some(seen) = bounced_in_a_room(panels, 1.0) else {
+            eprintln!("no ray tracing: skipped");
+            return;
+        };
+        assert_bounded("white corridor", &seen);
+    }
+
+    #[test]
+    fn the_shaders_cap_the_albedo_as_the_crate_says() {
+        assert!(LOOKUP_WGSL.contains(&format!("const CANDELITE_MOST_ALBEDO: f32 = {MOST_ALBEDO:?};")));
     }
 
     #[test]
@@ -4526,11 +4719,12 @@ mod test {
             half(words[i] & 0xFFFF)
         };
         // Its top, the sun on its back: half of the sun comes through, on both halves (red is
-        // 1 linear); the slab over the left half adds only a little light bounced back down.
+        // 1 linear, taken down to MOST_ALBEDO); the slab over the left half adds only a little
+        // light bounced back down.
         let (w, h) = (tile[2], tile[3]);
         let open = at(w * 7 / 8, h / 2);
         let under = at(w / 8, h / 2);
-        assert!((open - through).abs() < 0.05, "open {open}");
+        assert!((open - through * MOST_ALBEDO).abs() < 0.05, "open {open}");
         assert!(under >= open - 0.05 && under < open + 0.15, "under the slab {under}, open {open}");
     }
 
