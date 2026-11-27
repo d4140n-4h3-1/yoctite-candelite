@@ -504,6 +504,26 @@ impl SurfaceCache {
         Some(captures)
     }
 
+    /// The captures that fill again the cards of every mesh drawn with the material in `slot`,
+    /// for [`Self::record`]: for when that material has changed - its texture swapped, as a
+    /// game's seasons turn its leaves - and what the cards hold is out of date. Each keeps its
+    /// tiles.
+    pub fn recapture(&self, slot: u32) -> Vec<Capture> {
+        let mut captures = Vec::new();
+        for (&key, carded) in self.meshes.iter().filter(|(_, carded)| carded.slot == slot) {
+            for (card, &tile) in carded.cards.iter().zip(&carded.tiles) {
+                captures.push(Capture {
+                    mesh: MeshId(key),
+                    clusters: carded.clusters.clone(),
+                    slot,
+                    view_projection: card.view_projection(),
+                    viewport: tile,
+                });
+            }
+        }
+        captures
+    }
+
     /// How many meshes have smaller tiles than their size calls for, to fit (see
     /// [`Self::add_mesh`]).
     pub fn shrunk(&self) -> usize {
@@ -759,6 +779,19 @@ impl TraceScene {
         );
         self.built.clear();
         self.cutouts = None;
+    }
+
+    /// Gives `mesh`, added as a cutout, a new `mask` - where its texture is solid now - keeping
+    /// its triangles: for when its texture has changed, as leaves fall. Nothing for a mesh not
+    /// in, or added solid (traced opaque, it is never asked about its hits).
+    pub fn set_cutout(&mut self, mesh: MeshId, mask: Arc<CutoutMask>) {
+        let Some((_, old)) = self.meshes.get_mut(&mesh.0).and_then(|traced| traced.cutout.as_mut()) else {
+            return;
+        };
+        if !Arc::ptr_eq(old, &mask) {
+            *old = mask;
+            self.cutouts = None;
+        }
     }
 
     /// Takes `mesh` out.
@@ -4263,6 +4296,31 @@ mod test {
                 assert!(apart, "{a:?} {b:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_changed_material_has_its_meshes_captured_again_into_the_same_tiles() {
+        let Some((device, queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut pool = GeometryPool::new(&device, 1 << 10);
+        let mut cache = SurfaceCache::new(&device, 256);
+        let mut first = Vec::new();
+        for (slot, min, max) in [(0, [0.0; 3], [1.0; 3]), (1, [2.0, 0.0, 0.0], [3.0, 1.0, 1.0])] {
+            let (vertices, indices) = boxed(min, max, false);
+            let positions: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+            let dag = yoctite::build(&yoctite::Mesh::new(&positions, &indices), Default::default());
+            let mesh = pool.add_mesh(&device, &queue, &dag, &vertices);
+            first.push((slot, cache.add_mesh(mesh, &Bounds::of(positions.iter().copied()), &[0], slot).expect("room")));
+        }
+        let again = cache.recapture(1);
+        let (_, was) = &first[1];
+        assert_eq!(again.len(), CARDS);
+        for (a, b) in again.iter().zip(was) {
+            assert_eq!((a.mesh, a.slot, a.viewport), (b.mesh, b.slot, b.viewport));
+        }
+        assert!(cache.recapture(7).is_empty());
     }
 
     #[test]
