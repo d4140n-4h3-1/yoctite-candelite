@@ -14,7 +14,9 @@
 //!
 //! A card's tile is as many texels across as [`TEXELS_PER_METER`] of its side, within
 //! [`SMALLEST_TILE`] and [`LARGEST_TILE`]. Tiles are packed in shelves of rows a power of two
-//! high; a mesh taken out gives its tiles back.
+//! high; a mesh taken out gives its tiles back. A mesh whose tiles do not fit any more has them at
+//! half the texels across, or a quarter, or an eighth ([`MOST_SHRINKS`]): coarser, but cards -
+//! where it was left with none, a map's big meshes filling the atlas before the rest came.
 //!
 //! On the GPU each card is a [`GpuCard`], six a mesh one after another, and each mesh slot of the
 //! pool says where its first card is ([`SurfaceCache::mesh_cards`]), or [`NO_CARDS`].
@@ -43,6 +45,9 @@ pub const TEXELS_PER_METER: f32 = 8.0;
 pub const SMALLEST_TILE: u32 = 4;
 /// The most texels a tile has along a side.
 pub const LARGEST_TILE: u32 = 256;
+/// How many times a mesh's tiles are halved across, at most, to fit the atlas (see
+/// [`SurfaceCache::add_mesh`]).
+pub const MOST_SHRINKS: u32 = 3;
 /// How many cards a mesh has: two on each of the six faces of its bounds (see [`Card::of`]).
 pub const CARDS_PER_MESH: u32 = 12;
 /// How many cards a mesh has, as an array length.
@@ -221,7 +226,11 @@ pub struct GpuCard {
 }
 
 /// Hands out rectangles of a square atlas, in shelves: rows a power of two high, each filled from
-/// the left, first fit; a rectangle given back is joined with free neighbours in its row.
+/// the left, first fit; a rectangle given back is joined with free neighbours in its row. A
+/// rectangle goes in a shelf of its own height if one has room, or a new one; once the atlas has
+/// no rows left for a new shelf, in the lowest taller shelf with room. Kept to shelves of their
+/// own height alone, rectangles of a height whose shelves had filled found no room once every
+/// row was taken, with a quarter of the atlas free in shelves of other heights.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ShelfAllocator {
     size: u32,
@@ -267,7 +276,19 @@ impl ShelfAllocator {
             }
         }
         if self.next + class > self.size {
-            return None;
+            let taller = self
+                .shelves
+                .iter_mut()
+                .filter(|s| s.height > class && s.free.iter().any(|&(_, w)| w >= width))
+                .min_by_key(|s| s.height)?;
+            let i = taller.free.iter().position(|&(_, w)| w >= width).expect("filtered for it");
+            let (x, w) = taller.free[i];
+            if w == width {
+                taller.free.remove(i);
+            } else {
+                taller.free[i] = (x + width, w - width);
+            }
+            return Some([x, taller.y]);
         }
         let y = self.next;
         self.next += class;
@@ -279,10 +300,11 @@ impl ShelfAllocator {
         Some([0, y])
     }
 
-    /// Gives back what [`Self::allocate`] gave at `at` for `width` by `height`.
+    /// Gives back what [`Self::allocate`] gave at `at` for `width` by `height`: its shelf is the
+    /// one that starts at its top, of its height or taller.
     pub fn free(&mut self, at: [u32; 2], width: u32, height: u32) {
         let class = height.max(1).next_power_of_two();
-        let Some(shelf) = self.shelves.iter_mut().find(|s| s.y == at[1] && s.height == class) else {
+        let Some(shelf) = self.shelves.iter_mut().find(|s| s.y == at[1] && s.height >= class) else {
             return;
         };
         let (x, width) = (at[0], width.max(1));
@@ -305,6 +327,35 @@ impl ShelfAllocator {
 struct Carded {
     first_card: u32,
     tiles: [[u32; 4]; CARDS],
+    /// What it was captured from, to capture it again smaller: its cards, its clusters, the slot
+    /// of its material, and how many times its tiles are halved across.
+    cards: [Card; CARDS],
+    clusters: Vec<u32>,
+    slot: u32,
+    shrink: u32,
+}
+
+/// The sizes of the tiles for `cards`, each halved across `shrink` times, no smaller than
+/// [`SMALLEST_TILE`].
+fn tile_sizes(cards: &[Card; CARDS], shrink: u32) -> [[u32; 2]; CARDS] {
+    std::array::from_fn(|i| cards[i].tile_size().map(|side| (side >> shrink).max(SMALLEST_TILE)))
+}
+
+/// How many texels the tiles for `cards` take, halved across `shrink` times.
+fn tiles_area(cards: &[Card; CARDS], shrink: u32) -> u32 {
+    tile_sizes(cards, shrink).iter().map(|[w, h]| w * h).sum()
+}
+
+/// Room in `shelves` for tiles of `sizes`; [`None`], and `shelves` as they were, if not for all.
+fn place(shelves: &mut ShelfAllocator, sizes: &[[u32; 2]; CARDS]) -> Option<[[u32; 4]; CARDS]> {
+    let mut trial = shelves.clone();
+    let mut tiles = [[0u32; 4]; CARDS];
+    for (i, &[w, h]) in sizes.iter().enumerate() {
+        let [x, y] = trial.allocate(w, h)?;
+        tiles[i] = [x, y, w, h];
+    }
+    *shelves = trial;
+    Some(tiles)
 }
 
 /// Every mesh's cards, and the atlas they are captured into: see the module's description.
@@ -360,24 +411,67 @@ impl SurfaceCache {
 
     /// Gives `mesh`, of `bounds` in its own space, its cards and their tiles, and returns the
     /// captures that fill them - drawing `clusters` (the full mesh's, as the pool numbers them)
-    /// with the material in `slot` - for [`Self::record`]. [`None`] if the atlas has no room left;
-    /// nothing is kept then. A mesh already in it keeps what it has, and nothing is captured.
+    /// with the material in `slot` - for [`Self::record`]. A mesh already in it keeps what it has,
+    /// and nothing is captured.
+    ///
+    /// Where there is no room for it, whichever mesh has the biggest tiles - it, or one already
+    /// in - has them halved across, up to [`MOST_SHRINKS`] times, until there is: a mesh made
+    /// smaller is captured again, and its captures come back with the new mesh's. So the atlas's
+    /// biggest meshes, a map's walls and floors, go coarse first, and the rest keep their detail.
+    /// Shrinking only the new one, those that came first kept their tiles whole and filled the
+    /// atlas, and those after found no room even an eighth the size. [`None`] if there is no room
+    /// even so: nothing is changed then.
     pub fn add_mesh(&mut self, mesh: MeshId, bounds: &Bounds, clusters: &[u32], slot: u32) -> Option<Vec<Capture>> {
         if self.meshes.contains_key(&mesh.0) {
             return Some(Vec::new());
         }
         let cards = Card::of(bounds);
-        let mut tiles = [[0u32; 4]; CARDS];
-        for (i, card) in cards.iter().enumerate() {
-            let [w, h] = card.tile_size();
-            match self.shelves.allocate(w, h) {
-                Some([x, y]) => tiles[i] = [x, y, w, h],
-                None => {
-                    for tile in &tiles[..i] {
-                        self.shelves.free([tile[0], tile[1]], tile[2], tile[3]);
+        // Planned on a copy of the shelves, and kept only if it works out: the new mesh's halving,
+        // and the meshes already in made smaller, with their new tiles.
+        let mut shelves = self.shelves.clone();
+        let mut own = 0;
+        let mut smaller: HashMap<u32, (u32, [[u32; 4]; CARDS])> = HashMap::new();
+        let tiles = loop {
+            if let Some(tiles) = place(&mut shelves, &tile_sizes(&cards, own)) {
+                break tiles;
+            }
+            let shrink_of = |key: &u32, carded: &Carded| smaller.get(key).map_or(carded.shrink, |s| s.0);
+            let biggest = self
+                .meshes
+                .iter()
+                .filter(|(key, carded)| shrink_of(key, carded) < MOST_SHRINKS)
+                .max_by_key(|(key, carded)| tiles_area(&carded.cards, shrink_of(key, carded)))
+                .map(|(&key, carded)| (key, tiles_area(&carded.cards, shrink_of(&key, carded))));
+            let own_area = (own < MOST_SHRINKS).then(|| tiles_area(&cards, own));
+            match (biggest, own_area) {
+                (Some((key, area)), own_area) if own_area.is_none_or(|own_area| area > own_area) => {
+                    let carded = &self.meshes[&key];
+                    let (shrink, old) = smaller.get(&key).copied().unwrap_or((carded.shrink, carded.tiles));
+                    for tile in old {
+                        shelves.free([tile[0], tile[1]], tile[2], tile[3]);
                     }
-                    return None;
+                    let new = place(&mut shelves, &tile_sizes(&carded.cards, shrink + 1))?;
+                    smaller.insert(key, (shrink + 1, new));
                 }
+                (_, Some(_)) => own += 1,
+                _ => return None,
+            }
+        };
+        self.shelves = shelves;
+        let mut captures = Vec::new();
+        for (key, (shrink, new)) in smaller {
+            let carded = self.meshes.get_mut(&key).expect("planned from it");
+            carded.shrink = shrink;
+            carded.tiles = new;
+            for (i, (card, tile)) in carded.cards.iter().zip(new).enumerate() {
+                self.cards[carded.first_card as usize + i].tile = tile;
+                captures.push(Capture {
+                    mesh: MeshId(key),
+                    clusters: carded.clusters.clone(),
+                    slot: carded.slot,
+                    view_projection: card.view_projection(),
+                    viewport: tile,
+                });
             }
         }
         let first_card = self.free_cards.pop().unwrap_or_else(|| {
@@ -398,21 +492,22 @@ impl SurfaceCache {
             self.mesh_cards.resize(slot_index + 1, NO_CARDS);
         }
         self.mesh_cards[slot_index] = first_card;
-        self.meshes.insert(mesh.0, Carded { first_card, tiles });
+        captures.extend(cards.iter().zip(tiles).map(|(card, tile)| Capture {
+            mesh,
+            clusters: clusters.to_vec(),
+            slot,
+            view_projection: card.view_projection(),
+            viewport: tile,
+        }));
+        self.meshes.insert(mesh.0, Carded { first_card, tiles, cards, clusters: clusters.to_vec(), slot, shrink: own });
         self.changed = true;
-        Some(
-            cards
-                .iter()
-                .zip(tiles)
-                .map(|(card, tile)| Capture {
-                    mesh,
-                    clusters: clusters.to_vec(),
-                    slot,
-                    view_projection: card.view_projection(),
-                    viewport: tile,
-                })
-                .collect(),
-        )
+        Some(captures)
+    }
+
+    /// How many meshes have smaller tiles than their size calls for, to fit (see
+    /// [`Self::add_mesh`]).
+    pub fn shrunk(&self) -> usize {
+        self.meshes.values().filter(|carded| carded.shrink > 0).count()
     }
 
     /// Takes `mesh` out, giving back its tiles and cards.
@@ -4078,6 +4173,96 @@ mod test {
             indices.extend([first, first + 1, first + 2, first, first + 2, first + 3]);
         }
         (vertices, indices)
+    }
+
+    #[test]
+    fn with_every_row_taken_a_rectangle_goes_in_a_taller_shelf_with_room() {
+        let mut shelves = ShelfAllocator::new(64);
+        // Every row taken: a shelf 32 high, half full, and two 16 high, full.
+        assert_eq!(shelves.allocate(32, 32), Some([0, 0]));
+        assert_eq!(shelves.allocate(64, 16), Some([0, 32]));
+        assert_eq!(shelves.allocate(64, 16), Some([0, 48]));
+        // Another 16 high: no shelf of its height has room, and no rows are left for one - but
+        // the 32 high one has.
+        assert_eq!(shelves.allocate(16, 16), Some([32, 0]));
+        assert_eq!(shelves.allocate(16, 8), Some([48, 0]));
+        assert_eq!(shelves.allocate(8, 8), None);
+        // Given back, the room is there again.
+        shelves.free([32, 0], 16, 16);
+        assert_eq!(shelves.allocate(16, 4), Some([32, 0]));
+    }
+
+    #[test]
+    fn meshes_that_do_not_all_fit_share_the_atlas_the_biggest_tiles_halved_first() {
+        let Some((device, _queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut cache = SurfaceCache::new(&device, 1024);
+        // Twelve meshes 20 by 8 by 20 m: room for the first at full size, and not for the rest.
+        let bounds = Bounds { min: [-10.0, 0.0, -10.0], max: [10.0, 8.0, 10.0] };
+        let mut recaptured = false;
+        for k in 0..12 {
+            if k == 1 {
+                assert_eq!(cache.meshes[&0].shrink, 0, "the first fits whole");
+            }
+            let captures = cache.add_mesh(MeshId(k), &bounds, &[k], k).expect("room, made smaller");
+            recaptured |= captures.iter().any(|c| c.mesh != MeshId(k));
+            assert!(captures.iter().filter(|c| c.mesh == MeshId(k)).count() == CARDS);
+        }
+        let shrinks: Vec<u32> = cache.meshes.values().map(|c| c.shrink).collect();
+        assert!(recaptured, "the first, made smaller, is captured again: {shrinks:?}");
+        assert!(cache.meshes[&0].shrink > 0);
+        let (least, most) = (shrinks.iter().min().unwrap(), shrinks.iter().max().unwrap());
+        assert!(most - least <= 1, "the same meshes, much the same detail: {shrinks:?}");
+        // Each card's tile on the GPU is its mesh's, and none overlap.
+        for carded in cache.meshes.values() {
+            for (i, tile) in carded.tiles.iter().enumerate() {
+                assert_eq!(cache.cards()[carded.first_card as usize + i].tile, *tile);
+            }
+        }
+        let tiles: Vec<[u32; 4]> = cache.meshes.values().flat_map(|c| c.tiles).collect();
+        for (i, a) in tiles.iter().enumerate() {
+            for b in &tiles[i + 1..] {
+                let apart = a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] || a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1];
+                assert!(apart, "{a:?} {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_mesh_too_big_for_whats_left_gets_smaller_tiles_and_a_small_one_full_ones() {
+        let Some((device, _queue)) = device() else {
+            eprintln!("no GPU: skipped");
+            return;
+        };
+        let mut cache = SurfaceCache::new(&device, 512);
+        // 60 by 10 by 60 m: at full size its tiles take more than the whole atlas.
+        let big = Bounds { min: [-30.0, 0.0, -30.0], max: [30.0, 10.0, 30.0] };
+        let full: u32 = Card::of(&big).iter().map(|c| c.tile_size()).map(|[w, h]| w * h.next_power_of_two()).sum();
+        assert!(full > 512 * 512, "{full}");
+        let captures = cache.add_mesh(MeshId(0), &big, &[0], 0).expect("shrunk to fit");
+        assert_eq!(captures.len(), CARDS);
+        assert_eq!(cache.shrunk(), 1);
+        for (card, capture) in Card::of(&big).iter().zip(&captures) {
+            let [w, h] = card.tile_size();
+            assert!(capture.viewport[2] < w || capture.viewport[3] < h || w == SMALLEST_TILE, "{capture:?}");
+        }
+        // A 2 m box after it still has room at full size.
+        let small = Bounds { min: [-1.0; 3], max: [1.0; 3] };
+        let captures = cache.add_mesh(MeshId(1), &small, &[0], 0).expect("room");
+        for (card, capture) in Card::of(&small).iter().zip(&captures) {
+            assert_eq!([capture.viewport[2], capture.viewport[3]], card.tile_size());
+        }
+        assert_eq!(cache.shrunk(), 1);
+        // Tiles never overlap.
+        let tiles: Vec<[u32; 4]> = cache.cards().iter().map(|c| c.tile).collect();
+        for (i, a) in tiles.iter().enumerate() {
+            for b in &tiles[i + 1..] {
+                let apart = a[0] + a[2] <= b[0] || b[0] + b[2] <= a[0] || a[1] + a[3] <= b[1] || b[1] + b[3] <= a[1];
+                assert!(apart, "{a:?} {b:?}");
+            }
+        }
     }
 
     #[test]
